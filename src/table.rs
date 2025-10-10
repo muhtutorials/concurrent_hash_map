@@ -7,10 +7,10 @@ pub(crate) struct Table<K, V> {
 }
 
 impl<K, V> Table<K, V> {
-    pub(crate) fn new(len: usize) -> Self<K, V> {
+    pub(crate) fn new(len: usize) -> Self {
         let bins = vec![Atomic::null(); len];
         Self {
-            bins: bins.into_boxed_slice()
+            bins: bins.into_boxed_slice(),
         }
     }
 
@@ -23,16 +23,21 @@ impl<K, V> Table<K, V> {
         (hash & mask) as usize
     }
 
-    pub(crate) fn get<'g>(&self, bin_i: usize, guard: &'g Guard) -> Shared<'g, Bin<K, V>> {
+    pub(crate) fn get_by_index<'g>(&self, bin_i: usize, guard: &'g Guard) -> Shared<'g, Bin<K, V>> {
         self.bins[bin_i].load(Ordering::Acquire, guard)
+    }
+
+    pub(crate) fn get_by_hash<'g>(&self, hash: u64, guard: &'g Guard) -> Shared<'g, Bin<K, V>> {
+        let bin_i = self.bin_index(hash);
+        self.get_by_index(bin_i, guard)
     }
 
     pub(crate) fn compare_and_swap<'g, P>(
         &self,
         bin_i: usize,
         current: Shared<Bin<K, V>>,
-        new: Owned<Bin<K, V>>,
-        guard: &Guard,
+        new: P,
+        guard: &'g Guard,
     ) -> Result<Shared<'g, Bin<K, V>>, CompareExchangeError<'g, Bin<K, V>, P>>
     where
         P: Pointer<Bin<K, V>>,

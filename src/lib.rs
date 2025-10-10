@@ -3,13 +3,12 @@ mod table;
 
 use crate::node::Node;
 use crate::table::Table;
-use crossbeam::epoch::{Atomic, Guard, Owned, Pointer, Shared, pin};
+use crossbeam::epoch::{Atomic, Guard, Owned, Shared, pin};
 use node::Bin;
 use parking_lot::Mutex;
-use parking_lot::lock_api::{MutexGuard, RawMutex};
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hash, Hasher};
-use std::ops::Deref;
+use std::thread;
 use std::sync::atomic::{AtomicIsize, AtomicUsize, Ordering};
 
 /// The largest possible table capacity. This value must be
@@ -68,16 +67,18 @@ pub struct Map<K, V, S = RandomState> {
     /// when table is null, holds the initial table size to use upon
     /// creation, or 0 for default. After initialization, holds the
     /// length value upon which to resize the table.
-    // TODO: What size should it be in Rust?
-    // First bit set as `1` indicates that resize is finished.
+    // Resize threshold here is 0.75 * len.
+    // During normal operation `size_control` contains only the resize threshold.
+    // During resize `size_control` contains resize stamp and thread count:
     // [RESIZE_STAMP (16 bits)][NUMBER_OF_HELPING_THREADS]
+    // First bit set as `1` indicates that resize is finished.
     size_control: AtomicIsize,
     hasher_builder: S,
 }
 
 impl<K, V, S> Map<K, V, S>
 where
-    K: Hash,
+    K: Hash + Eq,
     S: BuildHasher,
 {
     pub fn get<'g>(&self, key: &K, guard: &'g Guard) -> Option<Shared<'g, V>> {
@@ -90,8 +91,7 @@ where
         if table_ref.bins.len() == 0 {
             return None;
         }
-        let bin_i = table_ref.bin_index(hash);
-        let bin = table_ref.get(bin_i, guard);
+        let bin = table_ref.get_by_hash(hash, guard);
         if bin.is_null() {
             return None;
         }
@@ -105,7 +105,7 @@ where
     }
 
     pub fn insert(&self, key: K, value: V) -> Option<()> {
-        Some(())
+        self.put(key, value, false)
     }
 
     fn put(&self, key: K, value: V, no_replace: bool) -> Option<()> {
@@ -126,12 +126,12 @@ where
                 continue;
             }
             let bin_i = table_ref.bin_index(hash);
-            let mut bin = table_ref.get(bin_i, guard);
+            let mut bin = table_ref.get_by_index(bin_i, guard);
             if bin.is_null() {
                 // bin is empty so stick new node at the front
                 match table_ref.compare_and_swap(bin_i, bin, new_node, guard) {
                     Ok(_old_null_ptr) => {
-                        self.add_len(1, Some(0));
+                        self.add_len(1, Some(0), guard);
                         return None;
                     }
                     Err(changed) => {
@@ -142,6 +142,12 @@ where
                 }
             }
             let bin_ref = unsafe { bin.deref() };
+            // TODO: clean it up
+            let (hash, key) = if let Bin::Node(Node {hash, ref key, ..}) = *new_node {
+                (hash, key)
+            } else {
+                unreachable!();
+            };
             // bin is not empty
             match bin_ref {
                 Bin::Node(head) if no_replace && head.hash == hash && head.key == key => {
@@ -149,10 +155,11 @@ where
                     return Some(());
                 }
                 Bin::Node(head) => {
+                    let head = Shared::from(head as *const _);
                     // bin is not empty, need to link to it, so we must take the lock
                     let _guard = head.mu.lock();
                     // need to check that it's still the head
-                    let current_head = table_ref.get(bin_i, guard);
+                    let current_head = table_ref.get_by_index(bin_i, guard);
                     if current_head.as_raw() != bin.as_raw() {
                         continue;
                     }
@@ -162,17 +169,15 @@ where
                     // current node
                     let mut node = head;
                     let old_value = loop {
-                        if node.hash == new_node.hash && node.key == new_node.key {
+                        if node.hash == hash && node.key == key {
                             // the key already exists in the map
                             if !no_replace {
                                 // the key is not absent so don't update
+                            } else if let Bin::Node(Node { value, ..}) = *new_node.into_box() {
+                                let garbage =
+                                    node.swap(value, Ordering::SeqCst, guard);
                             } else {
-                                let garbage = node.value.swap(
-                                    new_node.value,
-                                    Ordering::SeqCst,
-                                    guard,
-                                );
-                                unimplemented!("need to dispose of garbage");
+                                unreachable!()
                             }
                             break Some(());
                         }
@@ -190,7 +195,7 @@ where
                     if old_value.is_none() {
                         // increment length
                         // TODO: what do we pass as second argument?
-                        self.add_len(1, Some(0));
+                        self.add_len(1, Some(0), guard);
                     }
                     return old_value;
                 }
@@ -210,10 +215,45 @@ where
     }
 
     fn init_table<'g>(&self, guard: &'g Guard) -> Shared<'g, Table<K, V>> {
-        unimplemented!()
+        loop {
+            let table = self.table.load(Ordering::SeqCst, guard);
+            if !table.is_null() && !unsafe { table.deref() }.bins.is_empty() {
+                break table;
+            }
+            let mut size_control = self.size_control.load(Ordering::SeqCst);
+            if size_control < 0 {
+                // some else is initializing the table
+                thread::yield_now();
+                continue;
+            }
+            // TODO: why `-1` without shifting?
+            if let Ok(_) = self.size_control.compare_exchange(
+                size_control,
+                -1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                let mut table = self.table.load(Ordering::SeqCst, guard);
+                if table.is_null() || unsafe { table.deref() }.bins.is_empty() {
+                    let len = if size_control > 0 {
+                        size_control as usize
+                    } else {
+                        DEFAULT_CAPACITY
+                    };
+                    let new_table = Owned::new(Table::new(len));
+                    table = new_table.into_shared(guard);
+                    self.table.store(table, Ordering::SeqCst);
+                    let len = len as isize;
+                    size_control = len - (len >> 2); // len - len/4 = 0.75 * len
+                }
+                // Unset `-1`. It's similar to releasing the lock.
+                self.size_control.store(size_control, Ordering::SeqCst);
+                break table;
+            }
+        }
     }
 
-    fn add_len(&self, n: isize, resize_hint: Option<usize>) {
+    fn add_len(&self, n: isize, resize_hint: Option<usize>, guard: &Guard) {
         // If `resize_hint` is `None`, caller does not consider a resize.
         // If it's `Some(num)`, the caller traversed `num` nodes in a bin.
         if resize_hint.is_none() {
@@ -231,12 +271,10 @@ where
         };
         loop {
             let size_control = self.size_control.load(Ordering::SeqCst);
-            // TODO: shouldn't we extract the map size from resize stamp inside `size_control`?
-            if (len as isize) < size_control {
+            if size_control > len as isize {
                 break;
                 // we're not at the next resize point
             };
-            let guard = &pin();
             let mut table = self.table.load(Ordering::SeqCst, guard);
             if table.is_null() {
                 // table has been initialized by another thread
@@ -254,7 +292,7 @@ where
                 // Check if we're allowed to help resize.
                 // `size_control == resize_stamp` + 1 is the completion signal.
                 // The low 16 bits being 1 indicate that resize is finished.
-                if size_control == resize_stamp + MAX_RESIZERS || size_control == resize_stamp + 1 {
+                if size_control == resize_stamp + MAX_RESIZERS as isize || size_control == resize_stamp + 1 {
                     break;
                 }
                 let next_table = self.next_table.load(Ordering::SeqCst, guard);
@@ -305,12 +343,12 @@ where
         n.leading_zeros() as isize | (1 << (RESIZE_STAMP_BITS - 1))
     }
 
-    fn help_transfer(
+    fn help_transfer<'g>(
         &self,
-        table: Shared<Table<K, V>>,
+        table: Shared<'g, Table<K, V>>,
         next_table: *const Table<K, V>,
         guard: &Guard,
-    ) -> Shared<Table<K, V>> {
+    ) -> Shared<'g, Table<K, V>> {
         let next_table = Shared::from(next_table);
         if table.is_null() || next_table.is_null() {
             return table;
@@ -331,11 +369,11 @@ where
             {
                 break;
             }
-            if let Some(_) = self.size_control.compare_exchange(
+            if let Ok(_) = self.size_control.compare_exchange(
                 size_control,
                 size_control + 1,
                 Ordering::SeqCst,
-                Ordering::SeqCst
+                Ordering::SeqCst,
             ) {
                 self.transfer(table, next_table, guard);
                 break;
@@ -353,7 +391,7 @@ where
         let table_ref = unsafe { table.deref() };
         let len = table_ref.bins.len() as isize;
         // TODO: use `n_cpus` to help determine step
-        let step = MIN_TRANSFER_STEP;
+        let step = MIN_TRANSFER_STEP as isize;
         if next_table.is_null() {
             // We are initializing a resize.
             // `<< 1` multiplies len by two.
@@ -373,8 +411,9 @@ where
         let mut finishing = false;
         // current bin's index which is being processed
         let mut bin_i = 0;
-        // last bin's index to process
-        let mut last_bin_i = 0;
+        // Last bin's index to process (lower index bound).
+        // if transfer_index = 64, step = 16, then bound = 48.
+        let mut bound = 0;
         // Transfer index is the next bin to transfer.
         // Step is amount of bins to transfer at one go.
         // Bins are transferred from the end.
@@ -386,13 +425,14 @@ where
                 // 1: bin_i = -1
                 // 2: bin_i = 63
                 bin_i -= 1;
+                // 1: -1 >= 0 || false
                 // 2: 63 >= 48
                 // 2: we break and transfer bin_i = 63
-                if bin_i >= last_bin_i || finishing {
+                if bin_i >= bound || finishing {
                     advance_index = false;
                     break;
                 }
-                // `transfer_index` starts as table length
+                // `transfer_index` starts equaling table length
                 // 1: next_bin_i = 64
                 let next_bin_i = self.transfer_index.load(Ordering::SeqCst);
                 // TODO: why is `next_i = 0` true here?
@@ -401,8 +441,8 @@ where
                     advance_index = false;
                     break;
                 }
-                // 1: next_limit = 64 - 16 = 48
-                let next_limit = if next_bin_i > step as isize {
+                // 1: next_bound = 64 - 16 = 48
+                let next_bound = if next_bin_i > step {
                     next_bin_i - step
                 } else {
                     0
@@ -410,12 +450,14 @@ where
                 // 1: transfer_index = 48
                 if let Ok(_) = self.transfer_index.compare_exchange(
                     next_bin_i,
-                    next_limit,
+                    next_bound,
                     Ordering::SeqCst,
                     Ordering::SeqCst,
                 ) {
-                    last_bin_i = next_limit;
+                    bound = next_bound;
                     // 1: bin_i = 64
+                    // TODO: `i = nextIndex - 1` in Java code.
+                    // Check during tests if it's a bug.
                     bin_i = next_bin_i;
                     advance_index = false;
                     break;
@@ -429,7 +471,12 @@ where
                     self.next_table.store(Shared::null(), Ordering::SeqCst);
                     // TODO: deal with garbage
                     let garbage = self.table.swap(next_table, Ordering::SeqCst, guard);
-                    self.size_control.store((len << 1) - (len >> 1), Ordering::SeqCst);
+                    // len = 64
+                    // len << 1 = 64 × 2 = 128 (new table size)
+                    // len >> 1 = 64 ÷ 2 = 32 (half of old size)
+                    // control_size = 128 - 32 = 96 (load factor = 0.75)
+                    self.size_control
+                        .store((len << 1) - (len >> 1), Ordering::SeqCst);
                     return;
                 }
                 let size_control = self.size_control.load(Ordering::SeqCst);
@@ -439,7 +486,8 @@ where
                     Ordering::SeqCst,
                     Ordering::SeqCst,
                 ) {
-                    if (size_control - 2) != Self::resize_stamp(len as usize) << RESIZE_STAMP_SHIFT {
+                    if (size_control - 2) != Self::resize_stamp(len as usize) << RESIZE_STAMP_SHIFT
+                    {
                         return;
                     }
                     // resizing
@@ -450,7 +498,7 @@ where
                 }
                 continue;
             }
-            let bin = table_ref.get(bin_i as usize, guard);
+            let bin = table_ref.get_by_index(bin_i as usize, guard);
             if bin.is_null() {
                 advance_index = table_ref
                     .compare_and_swap(
@@ -465,10 +513,11 @@ where
             let bin_ref = unsafe { bin.deref() };
             match bin_ref {
                 Bin::Node(head) => {
+                    let head = Shared::from(head as *const _);
                     // bin is not empty, need to link to it, so we must take the lock
                     let _guard = head.mu.lock();
                     // need to check if it's still the head
-                    let current_head = table_ref.get(bin_i as usize, guard);
+                    let current_head = table_ref.get_by_index(bin_i as usize, guard);
                     if current_head.as_raw() != bin.as_raw() {
                         continue;
                     }
@@ -516,7 +565,7 @@ where
                     // no need to proceed past trailing sequence node,
                     // because next nodes after it don't change bins
                     while node != sequence_node {
-                        let link = if node.hash & len == 0 {
+                        let link = if node.hash & len as u64 == 0 {
                             // to the unchanged index bin
                             &mut unchanged_index_bin
                         } else {
@@ -527,15 +576,23 @@ where
                             hash: node.hash,
                             key: node.key.clone(),
                             value: node.value.clone(),
-                            next: *link, // going from the back
+                            // Nodes are appended to the linked list in reverse order,
+                            // because order of nodes in the bucket doesn't matter.
+                            // Appending to the front of a linked list is O(1).
+                            // Appending to the end would require:
+                            //  maintaining a tail pointer
+                            //  additional checks
+                            //  more complex code
+                            next: Atomic::from(*link),
                             mu: Mutex::new(()), // TODO: not sure if it's correct
-                        })).into_shared(guard);
+                        }))
+                        .into_shared(guard);
                         node = node.next.load(Ordering::SeqCst, guard);
                     }
-                    next_table_ref.store_bin(bin_i, unchanged_index_bin);
-                    next_table_ref.store_bin(bin_i + len, changed_index_bin);
+                    next_table_ref.store_bin(bin_i as usize, unchanged_index_bin);
+                    next_table_ref.store_bin((bin_i + len) as usize, changed_index_bin);
                     // "link" to the value moved to the new table
-                    table_ref.store_bin(bin_i, Owned::new(Bin::Moved(next_table.as_raw())));
+                    table_ref.store_bin(bin_i as usize, Owned::new(Bin::Moved(next_table.as_raw())));
                     advance_index = true;
                 }
                 Bin::Moved(_) => {
