@@ -1,5 +1,5 @@
 use crate::node::Bin;
-use crossbeam::epoch::{Atomic, CompareExchangeError, Guard, Owned, Pointer, Shared};
+use crossbeam::epoch::{unprotected, Atomic, CompareExchangeError, Guard, Pointer, Shared};
 use std::sync::atomic::Ordering;
 
 pub(crate) struct Table<K, V> {
@@ -52,7 +52,31 @@ impl<K, V> Table<K, V> {
         )
     }
 
-    pub(crate) fn store_bin(&self, bin_i: usize, new: Owned<Bin<K, V>>) {
+    pub(crate) fn store_bin<P>(&self, bin_i: usize, new: P)
+    where
+        P: Pointer<Bin<K, V>>,
+    {
         self.bins[bin_i].store(new, Ordering::Release);
+    }
+}
+
+impl<K, V> Drop for Table<K, V> {
+    fn drop(&mut self) {
+        if cfg!(debug_assertions) {
+            // We need to drop any forwarding nodes, since they are heap allocated.
+            // SAFETY: no one else is accessing this table anymore, so we own its contents.
+            let guard = unsafe { unprotected() };
+            for bin in &mut self.bins {
+                let bin = bin.swap(Shared::null(), Ordering::SeqCst, guard);
+                if bin.is_null() {
+                    continue;
+                }
+                // SAFETY: we have access to `&mut self`, so no one else
+                // will drop this value under us
+                let bin = unsafe { bin.into_owned() };
+                if let Bin::Moved(_) = *bin {
+                } else { unreachable!("dropped table with non empty bin") }
+            }
+        }
     }
 }

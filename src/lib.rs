@@ -3,13 +3,13 @@ mod table;
 
 use crate::node::Node;
 use crate::table::Table;
-use crossbeam::epoch::{Atomic, Guard, Owned, Shared, pin};
+use crossbeam::epoch::{Atomic, Guard, Owned, Shared, pin, unprotected};
 use node::Bin;
 use parking_lot::Mutex;
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hash, Hasher};
-use std::thread;
 use std::sync::atomic::{AtomicIsize, AtomicUsize, Ordering};
+use std::{mem, thread};
 
 /// The largest possible table capacity. This value must be
 /// exactly 1 << 30 to stay within Java array allocation and indexing
@@ -27,7 +27,7 @@ const DEFAULT_CAPACITY: usize = 16;
 /// actual floating point value isn't normally used -- it is
 /// simpler to use expressions such as (n >>> 2) for
 /// the associated resizing threshold.
-const LOAD_FACTOR: f64 = 0.75;
+const _LOAD_FACTOR: f64 = 0.75;
 
 /// Minimum number of re-binnings per transfer step. Ranges are
 /// subdivided to allow multiple resizer threads. This value
@@ -78,7 +78,8 @@ pub struct Map<K, V, S = RandomState> {
 
 impl<K, V, S> Map<K, V, S>
 where
-    K: Hash + Eq,
+    K: Hash + Eq + Clone + Sync + Send,
+    V: Sync + Send,
     S: BuildHasher,
 {
     pub fn get<'g>(&self, key: &K, guard: &'g Guard) -> Option<Shared<'g, V>> {
@@ -99,7 +100,8 @@ where
         if node.is_null() {
             return None;
         }
-        let v = unsafe { node.deref() }.value.load(Ordering::SeqCst, guard);
+        let node = unsafe { node.deref() }.as_node().unwrap();
+        let v = node.value.load(Ordering::SeqCst, guard);
         assert!(!v.is_null());
         Some(v)
     }
@@ -119,7 +121,7 @@ where
         }));
         let guard = &pin();
         let mut table = self.table.load(Ordering::SeqCst, guard);
-        let old_value = loop {
+        loop {
             let table_ref = unsafe { table.deref() };
             if table.is_null() || table_ref.bins.len() == 0 {
                 table = self.init_table(guard);
@@ -143,19 +145,18 @@ where
             }
             let bin_ref = unsafe { bin.deref() };
             // TODO: clean it up
-            let (hash, key) = if let Bin::Node(Node {hash, ref key, ..}) = *new_node {
+            let (hash, key) = if let Bin::Node(Node { hash, ref key, .. }) = *new_node {
                 (hash, key)
             } else {
                 unreachable!();
             };
             // bin is not empty
             match bin_ref {
-                Bin::Node(head) if no_replace && head.hash == hash && head.key == key => {
+                Bin::Node(head) if no_replace && head.hash == hash && &head.key == key => {
                     // if replacement is disallowed and first bin matches
                     return Some(());
                 }
                 Bin::Node(head) => {
-                    let head = Shared::from(head as *const _);
                     // bin is not empty, need to link to it, so we must take the lock
                     let _guard = head.mu.lock();
                     // need to check that it's still the head
@@ -167,41 +168,52 @@ where
                     // There can still be readers in the bin.
                     let mut bin_len = 1;
                     // current node
-                    let mut node = head;
+                    let mut current_node = bin;
                     let old_value = loop {
-                        if node.hash == hash && node.key == key {
+                        let node = unsafe { current_node.deref() }.as_node().unwrap();
+                        if node.hash == hash && &node.key == key {
                             // the key already exists in the map
                             if !no_replace {
                                 // the key is not absent so don't update
-                            } else if let Bin::Node(Node { value, ..}) = *new_node.into_box() {
-                                let garbage =
-                                    node.swap(value, Ordering::SeqCst, guard);
+                            } else if let Bin::Node(Node { value, .. }) = *new_node.into_box() {
+                                // SAFETY: we own value and have never shared it
+                                let garbage = node.value.swap(unsafe { value.into_owned() }, Ordering::SeqCst, guard);
+                                // SAFETY: need to guarantee that garbage is no longer reachable.
+                                // No thread that executes after this line can ever get a reference to garbage.
+                                // Possible scenarios:
+                                // - Another thread had read the value before the swap (has a reference to it).
+                                //   Either its guard was taken before ours, in which case that thread
+                                //   must be pinned to an epoch <= epoch of our guard, since garbage is placed
+                                //   in our epoch and won't be freed until next epoch, at which point that thread
+                                //   must have dropped its guard and with it any reference to the value.
+                                // - Another thread about to get a reference to this value. They execute after
+                                //   the swap, and therefore doesn't get a reference to the garbage, so freeing
+                                //   garbage is now OK.
+                                unsafe { guard.defer_destroy(garbage) }
                             } else {
                                 unreachable!()
                             }
                             break Some(());
                         }
                         // this ordering can probably be relaxed due to mutex
-                        let next = node.next.load(Ordering::SeqCst, guard);
-                        if next.is_null() {
+                        let next_node = node.next.load(Ordering::SeqCst, guard);
+                        if next_node.is_null() {
                             // we're at the end of the bin, stick node here
                             node.next.store(new_node, Ordering::SeqCst);
                             break None;
                         }
-                        node = unsafe { next.deref() };
+                        current_node = next_node;
                         bin_len += 1;
                     };
                     // TODO: treeify threshold
                     if old_value.is_none() {
                         // increment length
-                        // TODO: what do we pass as second argument?
-                        self.add_len(1, Some(0), guard);
+                        self.add_len(1, Some(bin_len), guard);
                     }
                     return old_value;
                 }
                 Bin::Moved(next_table) => {
-                    // FIXME: Moved(next_table) vs self.next_table
-                    table = self.help_transfer(table, *next_table, guard);
+                    let _ = self.help_transfer(table, *next_table, guard);
                     unimplemented!()
                 }
             }
@@ -259,7 +271,8 @@ where
         if resize_hint.is_none() {
             return;
         }
-        let traversed_nodes = resize_hint.unwrap();
+        // TODO: unimplemented yet
+        let _traversed_nodes = resize_hint.unwrap();
         let mut len = if n > 0 {
             let n = n as usize;
             self.len.fetch_add(n, Ordering::SeqCst) + n
@@ -275,7 +288,7 @@ where
                 break;
                 // we're not at the next resize point
             };
-            let mut table = self.table.load(Ordering::SeqCst, guard);
+            let table = self.table.load(Ordering::SeqCst, guard);
             if table.is_null() {
                 // table has been initialized by another thread
                 break;
@@ -292,7 +305,9 @@ where
                 // Check if we're allowed to help resize.
                 // `size_control == resize_stamp` + 1 is the completion signal.
                 // The low 16 bits being 1 indicate that resize is finished.
-                if size_control == resize_stamp + MAX_RESIZERS as isize || size_control == resize_stamp + 1 {
+                if size_control == resize_stamp + MAX_RESIZERS as isize
+                    || size_control == resize_stamp + 1
+                {
                     break;
                 }
                 let next_table = self.next_table.load(Ordering::SeqCst, guard);
@@ -309,7 +324,7 @@ where
                     Ordering::SeqCst,
                     Ordering::SeqCst,
                 ) {
-                    self.tranfer_table(table, next_table)
+                    self.transfer(table, next_table, guard)
                 };
             } else if let Ok(_) = self.size_control.compare_exchange(
                 size_control,
@@ -318,7 +333,7 @@ where
                 Ordering::SeqCst,
             ) {
                 // a resize is needed but has not yet started
-                self.tranfer_table(table, Shared::null())
+                self.transfer(table, Shared::null(), guard);
             }
             // another resize may be needed
             len = self.len.load(Ordering::SeqCst);
@@ -382,13 +397,20 @@ where
         next_table
     }
 
-    fn transfer(
+    fn transfer<'g>(
         &self,
-        table: Shared<Table<K, V>>,
-        mut next_table: Shared<Table<K, V>>,
-        guard: &Guard,
+        table: Shared<'g, Table<K, V>>,
+        mut next_table: Shared<'g, Table<K, V>>,
+        guard: &'g Guard,
     ) {
+        // SAFETY: These were read while guard was held. The code that drops these
+        // only drops them after:
+        //  1. They are no longer reachable;
+        //  2. Any outstanding references are no longer active. These references are
+        //     still active (marked by the guard), so the target of these references
+        //     won't be dropped while the guard remains active.
         let table_ref = unsafe { table.deref() };
+        let next_table_ref = unsafe { next_table.deref() };
         let len = table_ref.bins.len() as isize;
         // TODO: use `n_cpus` to help determine step
         let step = MIN_TRANSFER_STEP as isize;
@@ -404,7 +426,6 @@ where
             self.transfer_index.store(len, Ordering::SeqCst);
             next_table = self.next_table.load(Ordering::Relaxed, guard);
         }
-        let next_table_ref = unsafe { next_table.deref() };
         let next_len = next_table_ref.bins.len() as isize;
         // specifies if we should advance to the next bin to process it
         let mut advance_index = true;
@@ -469,8 +490,20 @@ where
                 if finishing {
                     // this branch is only taken for one thread partaking in the resize
                     self.next_table.store(Shared::null(), Ordering::SeqCst);
-                    // TODO: deal with garbage
                     let garbage = self.table.swap(next_table, Ordering::SeqCst, guard);
+                    // SAFETY: need to guarantee that garbage is no longer reachable.
+                    // No thread that executes after this line can ever get a reference to garbage.
+                    // Possible scenarios:
+                    // - Another thread had read the value before the swap (has a reference to it).
+                    //   Either its guard was taken before ours, in which case that thread
+                    //   must be pinned to an epoch <= epoch of our guard, since garbage is placed
+                    //   in our epoch and won't be freed until next epoch, at which point that thread
+                    //   must have dropped its guard and with it any reference to the value.
+                    // - Another thread about to get a reference to this value. They execute after
+                    //   the swap, and therefore doesn't get a reference to the garbage, so freeing
+                    //   garbage is now OK.
+                    unsafe { guard.defer_destroy(garbage) }
+                    // store new resize threshold
                     // len = 64
                     // len << 1 = 64 × 2 = 128 (new table size)
                     // len >> 1 = 64 ÷ 2 = 32 (half of old size)
@@ -510,10 +543,17 @@ where
                     .is_ok();
                 continue;
             }
-            let bin_ref = unsafe { bin.deref() };
-            match bin_ref {
+            // SAFETY: `bin` is a valid pointer.
+            // There are two cases when bin is invalidated:
+            //  1) If the table was resized, bin is a `Bin::Moved` and the resize has completed.
+            //     In this case the table and its heads will be dropped in the next epoch;
+            //  2) If the table is being resized, bin may have been swapped with a `Bin::Moved`.
+            //     The old bin will then be dropped in the following epoch.
+            // In both cases we held the guard when we got the reference to bin. If any such swap
+            // happened it happened after we read. Since we did the read while pinning the epoch,
+            // the drop must happen in the next epoch.
+            match unsafe { bin.deref() } {
                 Bin::Node(head) => {
-                    let head = Shared::from(head as *const _);
                     // bin is not empty, need to link to it, so we must take the lock
                     let _guard = head.mu.lock();
                     // need to check if it's still the head
@@ -523,16 +563,25 @@ where
                     }
                     // It's still the head so we can "own" the bin.
                     // There can still be readers in the bin.
-                    // Every second bin is moved during resize!
+                    // Every second bin is moved to a different index during resize!
                     // Optimization only helps with the trailing sequence!
                     let mut sequence_bit = head.hash & len as u64;
                     // first node in a sequence of nodes which are moved
                     // to new indices or a sequence of nodes which stay
                     // at the same indices
-                    let mut sequence_node = head;
+                    let mut sequence_node = bin;
                     // current node during bin traversal
-                    let mut node = head;
-                    while !node.next.is_null() {
+                    let mut current_node = bin;
+                    loop {
+                        // SAFETY: `node` is a valid pointer. It will only be dropped in the next epoch
+                        // after it is replaced with `Bin::Moved`. We read the bin and got to `node`, so it
+                        // wasn't swapped with `Bin::Moved` and we have the epoch pinned so the epoch cannot
+                        // have arrived yet, therefore, it will be dropped in a future epoch.
+                        let node = unsafe { current_node.deref() }.as_node().unwrap();
+                        let next_node = node.next.load(Ordering::SeqCst, guard);
+                        if next_node.is_null() {
+                            break;
+                        }
                         // Old table size: 16 (binary: 10000)
                         // New table size: 32 (binary: 100000)
                         //
@@ -549,9 +598,9 @@ where
                         let index_change_bit = node.hash & len as u64;
                         if index_change_bit != sequence_bit {
                             sequence_bit = index_change_bit;
-                            sequence_node = node;
+                            sequence_node = current_node;
                         }
-                        node = node.next.load(Ordering::SeqCst, guard);
+                        current_node = next_node;
                     }
                     // split bin in two
                     let mut unchanged_index_bin = Shared::null();
@@ -561,10 +610,15 @@ where
                     } else {
                         changed_index_bin = sequence_node;
                     }
-                    node = head;
+                    current_node = bin;
                     // no need to proceed past trailing sequence node,
                     // because next nodes after it don't change bins
-                    while node != sequence_node {
+                    while current_node != sequence_node {
+                        // SAFETY: `node` is a valid pointer. It will only be dropped in the next epoch
+                        // after it is replaced with `Bin::Moved`. We read the bin and got to `node`, so it
+                        // wasn't swapped with `Bin::Moved` and we have the epoch pinned so the epoch cannot
+                        // have arrived yet, therefore, it will be dropped in a future epoch.
+                        let node = unsafe { current_node.deref() }.as_node().unwrap();
                         let link = if node.hash & len as u64 == 0 {
                             // to the unchanged index bin
                             &mut unchanged_index_bin
@@ -584,15 +638,32 @@ where
                             //  additional checks
                             //  more complex code
                             next: Atomic::from(*link),
-                            mu: Mutex::new(()), // TODO: not sure if it's correct
+                            mu: Mutex::new(()),
                         }))
                         .into_shared(guard);
-                        node = node.next.load(Ordering::SeqCst, guard);
+                        current_node = node.next.load(Ordering::SeqCst, guard);
                     }
                     next_table_ref.store_bin(bin_i as usize, unchanged_index_bin);
                     next_table_ref.store_bin((bin_i + len) as usize, changed_index_bin);
                     // "link" to the value moved to the new table
-                    table_ref.store_bin(bin_i as usize, Owned::new(Bin::Moved(next_table.as_raw())));
+                    table_ref
+                        .store_bin(bin_i as usize, Owned::new(Bin::Moved(next_table.as_raw())));
+                    // Everything up to last sequence node is garbage.
+                    // All those nodes have been reallocated.
+                    while current_node != sequence_node {
+                        // SAFETY:
+                        // 1. The only way to get to node is through `table.bin[i]`.
+                        // Since `table.bin[i]` now contains `Bin::Moved`, node is not accessible.
+                        // 2. Any existing reference to node must have been taken before
+                        // `table.store.bin`. At that time we had the epoch pinned, so any threads
+                        // that have such a reference must be before or at our epoch. Since node
+                        // is not destroyed until the next epoch, those old references are since
+                        // they are tied to those old threads' pins of the old epoch.
+                        let node = unsafe { current_node.deref() }.as_node().unwrap();
+                        let next_node = node.next.load(Ordering::SeqCst, guard);
+                        unsafe { guard.defer_destroy(current_node) };
+                        current_node = next_node;
+                    }
                     advance_index = true;
                 }
                 Bin::Moved(_) => {
@@ -601,6 +672,43 @@ where
                     continue;
                 }
             }
+        }
+    }
+}
+
+impl<K, V, S> Drop for Map<K, V, S> {
+    fn drop(&mut self) {
+        // SAFETY: we have access to `&mut self`, so it's not concurrently accessed by anyone else
+        let guard = unsafe { unprotected() };
+        assert!(self.next_table.load(Ordering::SeqCst, guard).is_null());
+        let table = self.table.swap(Shared::null(), Ordering::SeqCst, guard);
+        // SAFETY: same as above and we own the table
+        let mut table = unsafe { table.into_owned() };
+        let bins = Vec::from(mem::replace(&mut table.bins, vec![].into_boxed_slice()));
+        for bin in bins {
+            let bin = unsafe { bin.into_owned() };
+            match *bin {
+                Bin::Moved(_) => {}
+                Bin::Node(_) => {
+                    let mut bin = bin;
+                    loop {
+                        // TODO: not sure why value can't be moved out of `Owned`
+                        let node = if let Bin::Node(node) = *bin.into_box() {
+                            node
+                        } else {
+                            unreachable!();
+                        };
+                        // SAFETY: We are dropping the map so no one else is accessing it.
+                        // We replace the bin with a null, so there's no future way to access it.
+                        // We own all the nodes in the list.
+                        let _ = unsafe { node.value.into_owned() };
+                        if node.next.load(Ordering::SeqCst, guard).is_null() {
+                            break;
+                        }
+                        bin = unsafe { node.next.into_owned() };
+                    }
+                }
+            };
         }
     }
 }
