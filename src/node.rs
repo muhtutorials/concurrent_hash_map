@@ -1,8 +1,16 @@
 use crate::table::Table;
-use crossbeam::epoch::{Atomic, Guard, Shared, pin};
+use crossbeam::epoch::{Atomic, Guard, Shared};
 use parking_lot::Mutex;
 use std::hash::Hash;
 use std::sync::atomic::Ordering;
+
+pub(crate) struct Node<K, V> {
+    pub(crate) hash: u64,
+    pub(crate) key: K,
+    pub(crate) value: Atomic<V>,
+    pub(crate) next: Atomic<Bin<K, V>>,
+    pub(crate) mu: Mutex<()>,
+}
 
 // if bin is empty we add a node atomically,
 // otherwise we take the lock and add another bin.
@@ -29,7 +37,6 @@ impl<K: Hash + Eq, V> Bin<K, V> {
                     // We won't be dropped until epoch passes, which is protected by guard.
                     bin = unsafe { next.deref() };
                 }
-
             }
             Bin::Moved(next_table) => {
                 let mut table = unsafe { &*next_table };
@@ -41,7 +48,6 @@ impl<K: Hash + Eq, V> Bin<K, V> {
                     if table.bins.is_empty() {
                         return Shared::null();
                     }
-                    let guard = &pin();
                     let bin = table.get_by_hash(hash, guard);
                     if bin.is_null() {
                         return Shared::null();
@@ -68,13 +74,4 @@ impl<K: Hash + Eq, V> Bin<K, V> {
             None
         }
     }
-}
-
-pub(crate) struct Node<K, V> {
-    pub(crate) hash: u64,
-    pub(crate) key: K,
-    pub(crate) value: Atomic<V>,
-    pub(crate) next: Atomic<Bin<K, V>>,
-    // if bin is not empty we take the lock and add a node
-    pub(crate) mu: Mutex<()>,
 }

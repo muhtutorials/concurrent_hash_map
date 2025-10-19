@@ -24,14 +24,14 @@ const DEFAULT_CAPACITY: usize = 16;
 
 /// The load factor for this table. Overrides of this value in
 /// constructors affect only the initial table capacity. The
-/// actual floating point value isn't normally used -- it is
-/// simpler to use expressions such as (n >>> 2) for
+/// actual floating point value isn't normally used. It is
+/// simpler to use expressions such as (n >> 2) for
 /// the associated resizing threshold.
 const _LOAD_FACTOR: f64 = 0.75;
 
 /// Minimum number of re-binnings per transfer step. Ranges are
 /// subdivided to allow multiple resizer threads. This value
-/// serves as a lower bound to avoid re-sizers encountering
+/// serves as a lower bound to avoid resizers encountering
 /// excessive memory contention. The value should be at least
 /// `DEFAULT_CAPACITY`.
 // Minimal amount of bins one thread can transfer
@@ -57,7 +57,7 @@ pub struct Map<K, V, S = RandomState> {
     /// Size is always a power of two. Accessed directly by iterators.
     table: Atomic<Table<K, V>>,
     next_table: Atomic<Table<K, V>>,
-    /// The next table index (plus one) to split while resizing.
+    /// index of bin to transfer next during resizing
     transfer_index: AtomicIsize,
     /// map length
     len: AtomicUsize,
@@ -72,6 +72,39 @@ pub struct Map<K, V, S = RandomState> {
     // During resize `size_control` contains resize stamp and thread count:
     // [RESIZE_STAMP (16 bits)][NUMBER_OF_HELPING_THREADS]
     // First bit set as `1` indicates that resize is finished.
+    // ┌─────────────────┐
+    // │        0        │ ────┐
+    // │ (Uninitialized) │     │
+    // └─────────────────┘     │
+    // │              │ Constructor with
+    // │ Initialize   │ initial capacity
+    // ▼              │        │
+    // ┌─────────────────┐     │
+    // │       -1        │ ◄───┘
+    // │ (Initializing)  │
+    // └─────────────────┘
+    // │
+    // │ Completion
+    // ▼
+    // ┌─────────────────┐
+    // │     Positive    │ ◄───┐
+    // │   (Normal op.)  │     │
+    // └─────────────────┘     │
+    // │              │        │
+    // │ Trigger      │      Resize
+    // │ resize       │     complete
+    // ▼              │        │
+    // ┌─────────────────┐     │
+    // │  (rs<<16) + 2   │ ────┘
+    // │ (Resize start)  │
+    // └─────────────────┘
+    // │
+    // │ More threads
+    // ▼ join
+    // ┌─────────────────┐
+    // │  (rs<<16) + k   │
+    // │(Resize progress)│
+    // └─────────────────┘
     size_control: AtomicIsize,
     hasher_builder: S,
 }
@@ -88,6 +121,8 @@ where
         if table.is_null() {
             return None;
         }
+        // SAFETY: We loaded the table while epoch was pinned. Table won't be
+        // deallocated until the next epoch.
         let table_ref = unsafe { table.deref() };
         if table_ref.bins.len() == 0 {
             return None;
@@ -101,9 +136,9 @@ where
             return None;
         }
         let node = unsafe { node.deref() }.as_node().unwrap();
-        let v = node.value.load(Ordering::SeqCst, guard);
-        assert!(!v.is_null());
-        Some(v)
+        let value = node.value.load(Ordering::SeqCst, guard);
+        assert!(!value.is_null());
+        Some(value)
     }
 
     pub fn insert(&self, key: K, value: V) -> Option<()> {
@@ -122,6 +157,16 @@ where
         let guard = &pin();
         let mut table = self.table.load(Ordering::SeqCst, guard);
         loop {
+            // SAFETY: Table is a valid pointer.
+            // 1) If table is the one we read before the loop, then we read it while
+            //    holding the guard, so it won't be dropped until after we drop that guard, because
+            //    the drop logic only queues a drop for the next epoch after removing the table;
+            // 2) If table is read by `init_table`, then either we did a load, and the argument is
+            //    as point 1, or we allocated a table, in which case the earliest it can be
+            //    deallocated is in the next epoch. We are holding up the epoch by holding the guard,
+            //    so dereference is safe;
+            // 3) If table is set by a `Moved` node below, it will either keep using table,
+            //    or use the next table raw pointer from inside `Moved`.
             let table_ref = unsafe { table.deref() };
             if table.is_null() || table_ref.bins.len() == 0 {
                 table = self.init_table(guard);
@@ -130,54 +175,62 @@ where
             let bin_i = table_ref.bin_index(hash);
             let mut bin = table_ref.get_by_index(bin_i, guard);
             if bin.is_null() {
-                // bin is empty so stick new node at the front
+                // bin is empty so we put a new node at the front
                 match table_ref.compare_and_swap(bin_i, bin, new_node, guard) {
                     Ok(_old_null_ptr) => {
+                        // If bin doesn't have next nodes its length (depth) is 0.
+                        // That's why we pass `Some(0)`.
                         self.add_len(1, Some(0), guard);
                         return None;
                     }
-                    Err(changed) => {
-                        assert!(!changed.current.is_null());
-                        new_node = changed.new;
-                        bin = changed.current;
+                    Err(err) => {
+                        assert!(!err.current.is_null());
+                        new_node = err.new;
+                        bin = err.current;
                     }
                 }
             }
+            // bin is not empty
             let bin_ref = unsafe { bin.deref() };
-            // TODO: clean it up
             let (hash, key) = if let Bin::Node(Node { hash, ref key, .. }) = *new_node {
                 (hash, key)
             } else {
                 unreachable!();
             };
-            // bin is not empty
             match bin_ref {
                 Bin::Node(head) if no_replace && head.hash == hash && &head.key == key => {
                     // if replacement is disallowed and first bin matches
                     return Some(());
                 }
                 Bin::Node(head) => {
-                    // bin is not empty, need to link to it, so we must take the lock
+                    // bin is not empty, so we must take the lock and link into it
                     let _guard = head.mu.lock();
-                    // need to check that it's still the head
+                    // check if head is still head
                     let current_head = table_ref.get_by_index(bin_i, guard);
-                    if current_head.as_raw() != bin.as_raw() {
+                    if current_head != bin {
                         continue;
                     }
                     // It's still the head so we can "own" the bin.
                     // There can still be readers in the bin.
                     let mut bin_len = 1;
-                    // current node
                     let mut current_node = bin;
                     let old_value = loop {
+                        // SAFETY: We read the bin while pinning the epoch. A bin will never be dropped
+                        // until the next epoch, after it's removed. Since it wasn't removed,
+                        // and the epoch was pinned, that cannot happen until we drop our guard.
                         let node = unsafe { current_node.deref() }.as_node().unwrap();
                         if node.hash == hash && &node.key == key {
                             // the key already exists in the map
                             if !no_replace {
-                                // the key is not absent so don't update
+                                // not allowed to update value
                             } else if let Bin::Node(Node { value, .. }) = *new_node.into_box() {
                                 // SAFETY: we own value and have never shared it
-                                let garbage = node.value.swap(unsafe { value.into_owned() }, Ordering::SeqCst, guard);
+                                // insert new value into node
+                                let garbage = node.value.swap(
+                                    unsafe { value.into_owned() },
+                                    Ordering::SeqCst,
+                                    guard,
+                                );
                                 // SAFETY: need to guarantee that garbage is no longer reachable.
                                 // No thread that executes after this line can ever get a reference to garbage.
                                 // Possible scenarios:
@@ -195,50 +248,43 @@ where
                             }
                             break Some(());
                         }
-                        // this ordering can probably be relaxed due to mutex
                         let next_node = node.next.load(Ordering::SeqCst, guard);
                         if next_node.is_null() {
-                            // we're at the end of the bin, stick node here
+                            // we're at the end of the bin, so we put node here
                             node.next.store(new_node, Ordering::SeqCst);
                             break None;
                         }
                         current_node = next_node;
                         bin_len += 1;
                     };
-                    // TODO: treeify threshold
                     if old_value.is_none() {
-                        // increment length
+                        // increment length if we put a new node
                         self.add_len(1, Some(bin_len), guard);
                     }
                     return old_value;
                 }
                 Bin::Moved(next_table) => {
-                    let _ = self.help_transfer(table, *next_table, guard);
-                    unimplemented!()
+                    table = self.help_transfer(table, *next_table, guard);
+                    continue;
                 }
             }
-        };
-    }
-
-    fn hash(&self, key: &K) -> u64 {
-        let mut hasher = self.hasher_builder.build_hasher();
-        key.hash(&mut hasher);
-        hasher.finish()
+        }
     }
 
     fn init_table<'g>(&self, guard: &'g Guard) -> Shared<'g, Table<K, V>> {
         loop {
             let table = self.table.load(Ordering::SeqCst, guard);
+            // SAFETY: We loaded the table while epoch was pinned. Table won't be
+            // deallocated until the next epoch.
             if !table.is_null() && !unsafe { table.deref() }.bins.is_empty() {
                 break table;
             }
             let mut size_control = self.size_control.load(Ordering::SeqCst);
             if size_control < 0 {
-                // some else is initializing the table
+                // someone else is initializing the table
                 thread::yield_now();
                 continue;
             }
-            // TODO: why `-1` without shifting?
             if let Ok(_) = self.size_control.compare_exchange(
                 size_control,
                 -1,
@@ -246,19 +292,20 @@ where
                 Ordering::SeqCst,
             ) {
                 let mut table = self.table.load(Ordering::SeqCst, guard);
+                // SAFETY: We loaded the table while epoch was pinned. Table won't be
+                // deallocated until the next epoch.
                 if table.is_null() || unsafe { table.deref() }.bins.is_empty() {
-                    let len = if size_control > 0 {
+                    let cap = if size_control > 0 {
                         size_control as usize
                     } else {
                         DEFAULT_CAPACITY
                     };
-                    let new_table = Owned::new(Table::new(len));
+                    let new_table = Owned::new(Table::new(cap));
                     table = new_table.into_shared(guard);
                     self.table.store(table, Ordering::SeqCst);
-                    let len = len as isize;
-                    size_control = len - (len >> 2); // len - len/4 = 0.75 * len
+                    size_control = (cap - (cap >> 2)) as isize; // cap - cap/4 = 0.75 * cap
                 }
-                // Unset `-1`. It's similar to releasing the lock.
+                // Unsets `-1`. It's similar to releasing the lock.
                 self.size_control.store(size_control, Ordering::SeqCst);
                 break table;
             }
@@ -267,11 +314,11 @@ where
 
     fn add_len(&self, n: isize, resize_hint: Option<usize>, guard: &Guard) {
         // If `resize_hint` is `None`, caller does not consider a resize.
-        // If it's `Some(num)`, the caller traversed `num` nodes in a bin.
+        // If it's `Some(n)`, the caller traversed `n` nodes in the bin.
         if resize_hint.is_none() {
             return;
         }
-        // TODO: unimplemented yet
+        // Treeify the linked list. Not implemented yet.
         let _traversed_nodes = resize_hint.unwrap();
         let mut len = if n > 0 {
             let n = n as usize;
@@ -285,14 +332,18 @@ where
         loop {
             let size_control = self.size_control.load(Ordering::SeqCst);
             if size_control > len as isize {
-                break;
                 // we're not at the next resize point
+                break;
             };
             let table = self.table.load(Ordering::SeqCst, guard);
             if table.is_null() {
                 // table has been initialized by another thread
                 break;
             }
+            // SAFETY: Table is only dropped on the next epoch change after it's swapped
+            // to null. We read it as not null, so it must not be dropped until the next
+            // epoch, since we hold a guard. We know that the current epoch will persist,
+            // and that our reference therefore will remain valid.
             let table_ref = unsafe { table.deref() };
             let n_bins = table_ref.bins.len();
             if n_bins >= MAXIMUM_CAPACITY {
@@ -303,8 +354,8 @@ where
             if size_control < 0 {
                 // Ongoing resize.
                 // Check if we're allowed to help resize.
-                // `size_control == resize_stamp` + 1 is the completion signal.
-                // The low 16 bits being 1 indicate that resize is finished.
+                // The low 16 bits being 1 indicate that resize is finished
+                // (size_control == resize_stamp + 1).
                 if size_control == resize_stamp + MAX_RESIZERS as isize
                     || size_control == resize_stamp + 1
                 {
@@ -320,7 +371,7 @@ where
                 // try to join
                 if let Ok(_) = self.size_control.compare_exchange(
                     size_control,
-                    size_control + 1,
+                    size_control + 1, // add our thread to resizers count
                     Ordering::SeqCst,
                     Ordering::SeqCst,
                 ) {
@@ -332,30 +383,12 @@ where
                 Ordering::SeqCst,
                 Ordering::SeqCst,
             ) {
-                // a resize is needed but has not yet started
+                // resize is needed but hasn't been started yet
                 self.transfer(table, Shared::null(), guard);
             }
             // another resize may be needed
             len = self.len.load(Ordering::SeqCst);
         }
-    }
-
-    /// Returns the stamp bits for resizing a table of size `n`.
-    /// Must be negative when shifted left by `RESIZE_STAMP_SHIFT`.
-    // When resize is in progress `size_control` should be negative.
-    // That's why we set MSB in `RESIZE_STAMP_BITS` part of `size_control` as 1.
-    //                ∨ (set as 1)
-    // Size Control: [RESIZE_STAMP][NUMBER_OF_HELPING_THREADS]
-    // Leading zeros take less space to represent a big number.
-    // 128 -> 24 leading zeros (binary: 11000).
-    // Only 5 bits needed instead of potentially 30+!
-    fn resize_stamp(n: usize) -> isize {
-        // n = 32 = 0010 0000
-        // 58 | (1 << (16 - 1))
-        // 0011 1010 | 1 << 15
-        // 0011 1010 | 1000 0000 0000 0000
-        // 1000 0000 0011 1010
-        n.leading_zeros() as isize | (1 << (RESIZE_STAMP_BITS - 1))
     }
 
     fn help_transfer<'g>(
@@ -368,9 +401,21 @@ where
         if table.is_null() || next_table.is_null() {
             return table;
         }
+        // SAFETY: Table is only dropped on the next epoch change after it's swapped
+        // to null. We read it as not null, so it must not be dropped until the next
+        // epoch, since we hold a guard. We know that the current epoch will persist,
+        // and that our reference therefore will remain valid.
         let table_ref = unsafe { table.deref() };
         let len = table_ref.bins.len();
         let resize_stamp = Self::resize_stamp(len) << RESIZE_STAMP_SHIFT;
+        // table == self.table.load(Ordering::SeqCst, guard)
+        // table: parameter passed to the method (expected to be the current table).
+        // self.table: current main table reference.
+        // Checks: table hasn't been replaced by a newer resize operation.
+        // next_table: local variable storing the new table from the `Moved` bin.
+        // next_table: field in Map that points to the new table during resizing.
+        // Checks: resize operation we're trying to help with
+        // is still ongoing and hasn't been completed.
         while table == self.table.load(Ordering::SeqCst, guard)
             && next_table == self.next_table.load(Ordering::SeqCst, guard)
         {
@@ -412,14 +457,12 @@ where
         let table_ref = unsafe { table.deref() };
         let next_table_ref = unsafe { next_table.deref() };
         let len = table_ref.bins.len() as isize;
-        // TODO: use `n_cpus` to help determine step
         let step = MIN_TRANSFER_STEP as isize;
         if next_table.is_null() {
             // We are initializing a resize.
             // `<< 1` multiplies len by two.
             let next_len = len << 1;
             let new_table = Owned::new(Table::new(next_len as usize));
-            // TODO: take care of garbage
             let garbage = self.next_table.swap(new_table, Ordering::SeqCst, guard);
             assert!(garbage.is_null());
             // initializing thread sets transfer index to old table's length
@@ -428,7 +471,7 @@ where
         }
         let next_len = next_table_ref.bins.len() as isize;
         // specifies if we should advance to the next bin to process it
-        let mut advance_index = true;
+        let mut advance = true;
         let mut finishing = false;
         // current bin's index which is being processed
         let mut bin_i = 0;
@@ -441,7 +484,7 @@ where
         // This loop tries to claim a region of bins to transfer.
         loop {
             // 1: transfer_index = 64
-            while advance_index {
+            while advance {
                 // we move backward in the bin slice
                 // 1: bin_i = -1
                 // 2: bin_i = 63
@@ -450,7 +493,7 @@ where
                 // 2: 63 >= 48
                 // 2: we break and transfer bin_i = 63
                 if bin_i >= bound || finishing {
-                    advance_index = false;
+                    advance = false;
                     break;
                 }
                 // `transfer_index` starts equaling table length
@@ -459,7 +502,7 @@ where
                 // TODO: why is `next_i = 0` true here?
                 if next_bin_i <= 0 {
                     bin_i -= 1;
-                    advance_index = false;
+                    advance = false;
                     break;
                 }
                 // 1: next_bound = 64 - 16 = 48
@@ -478,9 +521,9 @@ where
                     bound = next_bound;
                     // 1: bin_i = 64
                     // TODO: `i = nextIndex - 1` in Java code.
-                    // Check during tests if it's a bug.
+                    // check during tests if it's a bug
                     bin_i = next_bin_i;
-                    advance_index = false;
+                    advance = false;
                     break;
                 }
             }
@@ -503,7 +546,7 @@ where
                     //   the swap, and therefore doesn't get a reference to the garbage, so freeing
                     //   garbage is now OK.
                     unsafe { guard.defer_destroy(garbage) }
-                    // store new resize threshold
+                    // Store new resize threshold.
                     // len = 64
                     // len << 1 = 64 × 2 = 128 (new table size)
                     // len >> 1 = 64 ÷ 2 = 32 (half of old size)
@@ -519,6 +562,7 @@ where
                     Ordering::SeqCst,
                     Ordering::SeqCst,
                 ) {
+                    // size_control = (resize_stamp << RESIZE_STAMP_SHIFT) + number_of_workers + 2
                     if (size_control - 2) != Self::resize_stamp(len as usize) << RESIZE_STAMP_SHIFT
                     {
                         return;
@@ -526,14 +570,14 @@ where
                     // resizing
                     finishing = true;
                     // check if we can assist with any subsequent resize
-                    advance_index = true;
+                    advance = true;
                     bin_i = len;
                 }
                 continue;
             }
             let bin = table_ref.get_by_index(bin_i as usize, guard);
             if bin.is_null() {
-                advance_index = table_ref
+                advance = table_ref
                     .compare_and_swap(
                         bin_i as usize,
                         Shared::null(),
@@ -664,15 +708,39 @@ where
                         unsafe { guard.defer_destroy(current_node) };
                         current_node = next_node;
                     }
-                    advance_index = true;
+                    advance = true;
                 }
                 Bin::Moved(_) => {
                     // already processed
-                    advance_index = true;
+                    advance = true;
                     continue;
                 }
             }
         }
+    }
+
+    fn hash(&self, key: &K) -> u64 {
+        let mut hasher = self.hasher_builder.build_hasher();
+        key.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    /// Returns the stamp bits for resizing a table of size `n`.
+    /// Must be negative when shifted left by `RESIZE_STAMP_SHIFT`.
+    // When resize is in progress `size_control` should be negative.
+    // That's why we set MSB in `RESIZE_STAMP_BITS` part of `size_control` as 1.
+    //                ∨ (set as 1)
+    // Size Control: [RESIZE_STAMP][NUMBER_OF_HELPING_THREADS]
+    // Leading zeros take less space to represent a big number.
+    // 128 is 24 leading zeros (binary: 11000).
+    // Only 5 bits needed instead of potentially 30+!
+    fn resize_stamp(n: usize) -> isize {
+        // n = 32 = 0b0010_0000
+        // 58 | (1 << (16 - 1))
+        // 0b0011_1010 | 1 << 15
+        // 0b0011_1010 | 0b1000_0000_0000_0000
+        // 0b1000_0000_0011_1010
+        n.leading_zeros() as isize | (1 << (RESIZE_STAMP_BITS - 1))
     }
 }
 
@@ -688,7 +756,6 @@ impl<K, V, S> Drop for Map<K, V, S> {
         for bin in bins {
             let bin = unsafe { bin.into_owned() };
             match *bin {
-                Bin::Moved(_) => {}
                 Bin::Node(_) => {
                     let mut bin = bin;
                     loop {
@@ -708,6 +775,7 @@ impl<K, V, S> Drop for Map<K, V, S> {
                         bin = unsafe { node.next.into_owned() };
                     }
                 }
+                Bin::Moved(_) => {}
             };
         }
     }

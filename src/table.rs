@@ -1,5 +1,5 @@
 use crate::node::Bin;
-use crossbeam::epoch::{unprotected, Atomic, CompareExchangeError, Guard, Pointer, Shared};
+use crossbeam::epoch::{Atomic, CompareExchangeError, Guard, Pointer, Shared, unprotected};
 use std::sync::atomic::Ordering;
 
 pub(crate) struct Table<K, V> {
@@ -7,18 +7,19 @@ pub(crate) struct Table<K, V> {
 }
 
 impl<K, V> Table<K, V> {
-    pub(crate) fn new(len: usize) -> Self {
-        let bins = vec![Atomic::null(); len];
+    pub(crate) fn new(cap: usize) -> Self {
+        let bins = vec![Atomic::null(); cap];
         Self {
             bins: bins.into_boxed_slice(),
         }
     }
 
     pub(crate) fn bin_index(&self, hash: u64) -> usize {
-        // hash = 0b10101001
-        // len = 4 = 0b100
-        // mask = 4 - 1 = 0b11
-        // hash & mask = 0b...01 & 0b11 = 0b01
+        // hash = 0b1010_1001
+        // len = 4 = 0b0000_0100
+        // mask = 4 - 1 = 0b0000_0011
+        // index = hash & mask
+        // index = 0b1010_1001 & 0b0000_0011 = 0b0000_0001 = 1
         let mask = self.bins.len() as u64 - 1;
         (hash & mask) as usize
     }
@@ -45,9 +46,8 @@ impl<K, V> Table<K, V> {
         self.bins[bin_i].compare_exchange(
             current,
             new,
-            // ordering?
-            Ordering::SeqCst,
-            Ordering::SeqCst,
+            Ordering::AcqRel,
+            Ordering::AcqRel,
             guard,
         )
     }
@@ -62,20 +62,20 @@ impl<K, V> Table<K, V> {
 
 impl<K, V> Drop for Table<K, V> {
     fn drop(&mut self) {
-        if cfg!(debug_assertions) {
-            // We need to drop any forwarding nodes, since they are heap allocated.
-            // SAFETY: no one else is accessing this table anymore, so we own its contents.
-            let guard = unsafe { unprotected() };
-            for bin in &mut self.bins {
-                let bin = bin.swap(Shared::null(), Ordering::SeqCst, guard);
-                if bin.is_null() {
-                    continue;
-                }
-                // SAFETY: we have access to `&mut self`, so no one else
-                // will drop this value under us
-                let bin = unsafe { bin.into_owned() };
-                if let Bin::Moved(_) = *bin {
-                } else { unreachable!("dropped table with non empty bin") }
+        // We need to drop any forwarding nodes, since they are heap allocated.
+        // SAFETY: no one else is accessing this table anymore, so we own its contents.
+        let guard = unsafe { unprotected() };
+        for bin in &mut self.bins {
+            let bin = bin.swap(Shared::null(), Ordering::SeqCst, guard);
+            if bin.is_null() {
+                continue;
+            }
+            // SAFETY: we have access to `&mut self`, so no one else
+            // will drop this value under us
+            let bin = unsafe { bin.into_owned() };
+            if let Bin::Moved(_) = *bin {
+            } else {
+                unreachable!("dropped table with non empty bin")
             }
         }
     }
