@@ -75,3 +75,19 @@ impl<K: Hash + Eq, V> Bin<K, V> {
         }
     }
 }
+
+unsafe impl<K, V> Send for Bin<K, V>
+where
+    K: Send,
+    V: Send,
+    Node<K, V>: Send,
+    Table<K, V>: Send,
+{}
+
+unsafe impl<K, V> Sync for Bin<K, V>
+where
+    K: Sync,
+    V: Sync,
+    Node<K, V>: Sync,
+    Table<K, V>: Sync,
+{}

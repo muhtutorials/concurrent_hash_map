@@ -46,8 +46,8 @@ impl<K, V> Table<K, V> {
         self.bins[bin_i].compare_exchange(
             current,
             new,
-            Ordering::AcqRel,
-            Ordering::AcqRel,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
             guard,
         )
     }
