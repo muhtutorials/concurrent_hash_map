@@ -1,3 +1,4 @@
+mod iter;
 mod node;
 mod table;
 
@@ -125,8 +126,8 @@ where
         }
     }
 
-    pub fn with_capacity(n: usize) -> Self {
-        assert_ne!(n, 0);
+    pub fn with_capacity(cap: usize) -> Self {
+        assert_ne!(cap, 0);
         // `map` is immutable because no methods take `&mut self`
         let map = Self::new();
         // size = 1.0 + 16 / 0.75
@@ -134,7 +135,7 @@ where
         // size = 22.333
         // size = 22 (as usize)
         // without 1.0 added: 21 × 0.75 = 15.75 ≈ 15 elements (not requested 16)
-        let size = (1.0 + (n as f64) / LOAD_FACTOR) as usize;
+        let size = (1.0 + (cap as f64) / LOAD_FACTOR) as usize;
         // This is `tableSizeFor` in Java implementation.
         // See `Hacker's Delight, sec 3.2` for the algorithm.
         let cap = min(MAXIMUM_CAPACITY, size.next_power_of_two());
