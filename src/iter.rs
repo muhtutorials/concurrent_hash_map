@@ -5,9 +5,11 @@ use std::hash::Hash;
 use std::sync::atomic::Ordering;
 
 struct Iter<'g, K, V> {
-    /// current table; updated if resized
+    /// Current table.
+    /// Replaced by a new one if a resize happens.
     table: Option<&'g Table<K, V>>,
-    /// the last node iterated over
+    /// The last node iterated over.
+    // Used for traversal of the linked list inside a bin
     prev: Option<&'g Node<K, V>>,
     /// Current bin index. Could be in any table during resize.
     index: usize,
@@ -22,7 +24,7 @@ struct Iter<'g, K, V> {
 }
 
 impl<'g, K, V> Iter<'g, K, V> {
-    fn new(table: Shared<'g, Table<K, V>>, guard: &'g Guard) -> Self {
+    pub(crate) fn new(table: Shared<'g, Table<K, V>>, guard: &'g Guard) -> Self {
         let (table, len) = if table.is_null() {
             (None, 0)
         } else {
@@ -43,15 +45,16 @@ impl<'g, K, V> Iter<'g, K, V> {
         }
     }
 
-    fn push_state(&mut self, table: &'g Table<K, V>, len: usize, index: usize) {
+    fn push_state(&mut self, table: &'g Table<K, V>, cap: usize, index: usize) {
         let mut spare = self.spare.take();
         if let Some(ref mut stack) = spare {
             self.spare = stack.next.take();
         }
         let new_stack = TableStack {
             table,
-            len,
+            cap,
             index,
+            // ... cap 64 -> cap 32 -> cap 16
             next: self.stack.take(),
         };
         self.stack = if let Some(mut stack) = spare {
@@ -62,20 +65,20 @@ impl<'g, K, V> Iter<'g, K, V> {
         };
     }
 
-    fn recover_state(&mut self, mut len: usize) {
+    fn recover_state(&mut self, mut cap: usize) {
         while let Some(ref mut stack) = self.stack {
-            if self.index + stack.len < len {
+            if self.index + stack.cap < cap {
                 // if we haven't checked the high part of this bucket,
                 // then don't pop the stack, and instead move on to that bin.
-                self.index += stack.len;
+                self.index += stack.cap;
                 break;
             }
             // popping stack
             let mut stack = self.stack.take().expect("while let Some");
-            len = stack.len;
+            cap = stack.cap;
             self.table = Some(stack.table);
-            self.stack = stack.next.take();
             self.index = stack.index;
+            self.stack = stack.next.take();
             // save stack frame for reuse
             stack.next = self.spare.take();
             self.spare = Some(stack);
@@ -84,7 +87,7 @@ impl<'g, K, V> Iter<'g, K, V> {
             // move to next "part" of the top-level bin
             // in the largest table
             self.index += self.base_cap;
-            if self.index >= len {
+            if self.index >= cap {
                 // we've gone past the last part of this top-level bin,
                 // so move to the next top-level bin
                 self.base_index += 1;
@@ -119,7 +122,7 @@ impl<'g, K: Hash + Eq, V> Iterator for Iter<'g, K, V> {
                 return None;
             }
             let table = self.table.expect("`is_none` in if statement above");
-            let len = table.bins.len();
+            let cap = table.bins.len();
             let bin = table.get_by_index(self.index, self.guard);
             if !bin.is_null() {
                 match unsafe { bin.deref() } {
@@ -127,19 +130,20 @@ impl<'g, K: Hash + Eq, V> Iterator for Iter<'g, K, V> {
                         node = Some(n);
                     }
                     Bin::Moved(next_table) => {
+                        // set next table as current table
                         self.table = Some(unsafe { &**next_table });
                         self.prev = None;
-                        self.push_state(table, len, self.index);
+                        self.push_state(table, cap, self.index);
                         continue;
                     }
                 }
             }
             if self.stack.is_some() {
-                self.recover_state(len);
+                self.recover_state(cap);
             } else {
-                self.index = self.index + self.base_cap;
                 // visit upper slots if present
-                if self.index >= len {
+                self.index = self.index + self.base_cap;
+                if self.index >= cap {
                     self.base_index += 1;
                     self.index = self.base_index;
                 }
@@ -148,12 +152,12 @@ impl<'g, K: Hash + Eq, V> Iterator for Iter<'g, K, V> {
     }
 }
 
-// Records the table, its length, and current traversal index for a
-// traverser that must process a region of a forwarded table before
+// Records the table, its capacity, and current iteration index for an
+// iterator that must process a region of a moved table before
 // proceeding with current table.
 struct TableStack<'g, K, V> {
     table: &'g Table<K, V>,
-    len: usize,
+    cap: usize,
     index: usize,
     next: Option<Box<TableStack<'g, K, V>>>,
 }
