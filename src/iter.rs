@@ -46,18 +46,21 @@ impl<'g, K, V> Iter<'g, K, V> {
     }
 
     fn push_state(&mut self, table: &'g Table<K, V>, cap: usize, index: usize) {
-        let mut spare = self.spare.take();
-        if let Some(ref mut stack) = spare {
-            self.spare = stack.next.take();
-        }
         let new_stack = TableStack {
             table,
             cap,
             index,
-            // ... cap 64 -> cap 32 -> cap 16
+            // new stack is appended to the front of the linked list:
+            // table (cap 64) -> table (cap 32) -> table (cap 16)
             next: self.stack.take(),
         };
+        // removes from spare discarded stack
+        let mut spare = self.spare.take();
         self.stack = if let Some(mut stack) = spare {
+            // sets next spare stack
+            self.spare = stack.next.take();
+            // assigns new stack to previously discarded stack,
+            // if it exists, to avoid new allocation
             *stack = new_stack;
             Some(stack)
         } else {
@@ -73,13 +76,15 @@ impl<'g, K, V> Iter<'g, K, V> {
                 self.index += stack.cap;
                 break;
             }
-            // popping stack
+            // remove stack
             let mut stack = self.stack.take().expect("while let Some");
             cap = stack.cap;
+            // restore state
             self.table = Some(stack.table);
             self.index = stack.index;
             self.stack = stack.next.take();
-            // save stack frame for reuse
+            // save stack frame for reuse by appending it
+            // to the front of the linked list (self.spare)
             stack.next = self.spare.take();
             self.spare = Some(stack);
         }
